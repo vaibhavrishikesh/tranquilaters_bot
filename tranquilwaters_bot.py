@@ -202,6 +202,79 @@ def pms_report(action: str) -> str:
     return "Unknown PMS report."
 
 
+def pms_report_sections() -> dict[str, str]:
+    pms_config, auth = pms_read_context()
+    result: dict[str, str] = {}
+    for item in ("rooms", "inhouse", "upcoming"):
+        try:
+            result[item] = pms_bot.render_action(pms_config, auth, item).strip()
+        except Exception as exc:
+            LOG.exception("PMS report section failed: %s", item)
+            result[item] = f"{item.title()} failed: {type(exc).__name__}: {exc}"
+    return result
+
+
+def section_count(text: str) -> str:
+    first = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    if "·" in first:
+        return first.rsplit("·", 1)[-1].strip()
+    return "-"
+
+
+def room_status_counts(rooms_text: str) -> dict[str, int]:
+    counts = {"available": 0, "occupied": 0, "blocked": 0, "other": 0}
+    for line in rooms_text.splitlines()[2:]:
+        upper = line.upper()
+        if "AVAILABLE" in upper:
+            counts["available"] += 1
+        elif "OCCUPIED" in upper:
+            counts["occupied"] += 1
+        elif "FULL" in upper or "HOLD" in upper or "BLOCK" in upper:
+            counts["blocked"] += 1
+        elif line.strip():
+            counts["other"] += 1
+    return counts
+
+
+def indent_section(text: str) -> str:
+    lines = [line.rstrip() for line in text.splitlines()]
+    while lines and not lines[0]:
+        lines.pop(0)
+    return "\n".join(f"  {line}" if line else "" for line in lines)
+
+
+def professional_doc_report() -> str:
+    sections = pms_report_sections()
+    now = datetime.now().strftime("%d %b %Y, %I:%M %p")
+    room_counts = room_status_counts(sections.get("rooms", ""))
+    inhouse_count = section_count(sections.get("inhouse", ""))
+    upcoming_count = section_count(sections.get("upcoming", ""))
+    divider = "─" * 62
+    return (
+        f"\n\n{divider}\n"
+        f"TRANQUILWATERS PMS DAILY REPORT\n"
+        f"Generated: {now}\n"
+        f"Source: Zimmerstack PMS via TranquilWaters Bot\n"
+        f"{divider}\n\n"
+        "EXECUTIVE SUMMARY\n"
+        f"• Available rooms: {room_counts['available']}\n"
+        f"• Occupied rooms: {room_counts['occupied']}\n"
+        f"• Blocked / held rooms: {room_counts['blocked']}\n"
+        f"• In-house guests: {inhouse_count}\n"
+        f"• Upcoming bookings: {upcoming_count}\n\n"
+        "ROOM STATUS\n"
+        f"{indent_section(sections.get('rooms', 'No room data.'))}\n\n"
+        "IN-HOUSE GUESTS\n"
+        f"{indent_section(sections.get('inhouse', 'No in-house data.'))}\n\n"
+        "UPCOMING BOOKINGS\n"
+        f"{indent_section(sections.get('upcoming', 'No upcoming data.'))}\n\n"
+        "TEAM NOTES\n"
+        "• Review unpaid or pending guest balances before checkout.\n"
+        "• Use Lily's Desk PMS bot for booking, payment, check-in, checkout, and room status write actions.\n"
+        "• This document is an operational log; PMS remains the source of truth.\n"
+    )
+
+
 GOOGLE_DOC_SCOPES = (
     "https://www.googleapis.com/auth/documents",
     "https://www.googleapis.com/auth/drive.file",
@@ -276,11 +349,10 @@ def save_pms_report_to_google_doc(config: Config) -> str:
     ready, detail = google_docs_ready(config)
     if not ready:
         return f"Google Docs not ready: {detail}"
-    report = pms_report("report")
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    report = professional_doc_report()
     title = f"TranquilWaters PMS Report {datetime.now().strftime('%Y-%m-%d')}"
     document_id = config.google_docs_report_id or create_google_doc(config, title)
-    link = append_google_doc(config, document_id, f"\n\n## PMS Report — {now}\n\n{report}\n")
+    link = append_google_doc(config, document_id, report)
     return f"Saved PMS report to Google Docs:\n{link}"
 
 
