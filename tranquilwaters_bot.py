@@ -12,6 +12,7 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -51,6 +52,11 @@ class Config:
     google_credentials_file: str
     google_docs_folder_id: str
     google_docs_report_id: str
+    state_file: Path
+    notes_file: Path
+    auto_report_enabled: bool
+    auto_report_time: str
+    auto_report_chat_id: int | None
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -74,6 +80,11 @@ class Config:
             google_credentials_file=os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip(),
             google_docs_folder_id=os.getenv("GOOGLE_DOCS_FOLDER_ID", "").strip(),
             google_docs_report_id=os.getenv("GOOGLE_DOCS_REPORT_ID", "").strip(),
+            state_file=Path(os.getenv("HERMES_STATE_FILE", "/var/lib/tranquilwaters-bot/state.json")),
+            notes_file=Path(os.getenv("HERMES_NOTES_FILE", "/var/lib/tranquilwaters-bot/team-notes.jsonl")),
+            auto_report_enabled=os.getenv("AUTO_DOC_REPORT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"},
+            auto_report_time=os.getenv("AUTO_DOC_REPORT_TIME", "09:00").strip() or "09:00",
+            auto_report_chat_id=int(os.getenv("AUTO_DOC_REPORT_CHAT_ID", "0") or "0") or None,
         )
 
 
@@ -171,7 +182,10 @@ def help_text(config: Config) -> str:
         "• /report — rooms, in-house, and upcoming summary\n"
         "• /status — PMS/API health\n"
         "• /doc_report — append today's PMS summary to Google Docs\n"
-        "• /doc_status — check Google Docs setup\n\n"
+        "• /doc_status — check Google Docs setup\n"
+        "• /note <text> — save a team note locally\n"
+        "• /notes — show recent team notes\n"
+        "• /doc_notes — append recent team notes to Google Docs\n\n"
         "PMS write actions stay in the Lily's Desk PMS bot."
     )
 
@@ -356,6 +370,131 @@ def save_pms_report_to_google_doc(config: Config) -> str:
     return f"Saved PMS report to Google Docs:\n{link}"
 
 
+def load_json_file(path: Path) -> dict[str, Any]:
+    try:
+        return json.loads(path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_json_file(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+    tmp.replace(path)
+
+
+def ist_now() -> datetime:
+    return datetime.now(ZoneInfo("Asia/Kolkata"))
+
+
+def parse_hhmm(value: str) -> tuple[int, int]:
+    hour, minute = value.split(":", 1)
+    return max(0, min(23, int(hour))), max(0, min(59, int(minute)))
+
+
+def auto_report_due(config: Config, now: datetime) -> bool:
+    if not config.auto_report_enabled:
+        return False
+    try:
+        hour, minute = parse_hhmm(config.auto_report_time)
+    except Exception:
+        LOG.warning("Invalid AUTO_DOC_REPORT_TIME=%s", config.auto_report_time)
+        return False
+    if (now.hour, now.minute) < (hour, minute):
+        return False
+    state = load_json_file(config.state_file)
+    return state.get("last_auto_doc_report_date") != now.date().isoformat()
+
+
+def mark_auto_report_done(config: Config, now: datetime) -> None:
+    state = load_json_file(config.state_file)
+    state["last_auto_doc_report_date"] = now.date().isoformat()
+    state["last_auto_doc_report_at"] = now.isoformat()
+    save_json_file(config.state_file, state)
+
+
+def auto_report_chat_id(config: Config) -> int | None:
+    if config.auto_report_chat_id:
+        return config.auto_report_chat_id
+    if config.allowed_chat_ids:
+        return sorted(config.allowed_chat_ids)[0]
+    return None
+
+
+def maybe_run_auto_report(config: Config) -> None:
+    now = ist_now()
+    if not auto_report_due(config, now):
+        return
+    chat_id = auto_report_chat_id(config)
+    try:
+        result = save_pms_report_to_google_doc(config)
+        mark_auto_report_done(config, now)
+        if chat_id:
+            send_message(config, chat_id, f"Auto daily PMS report saved.\n{result}")
+        LOG.info("Auto daily PMS report saved for %s", now.date().isoformat())
+    except Exception:
+        LOG.exception("Auto daily PMS report failed")
+
+
+def append_team_note(config: Config, chat_id: int, user_id: int, author: str, note: str) -> str:
+    note = note.strip()
+    if not note:
+        return "Usage: /note <team note>"
+    config.notes_file.parent.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "created_at": ist_now().isoformat(timespec="seconds"),
+        "chat_id": chat_id,
+        "user_id": user_id,
+        "author": author or "Team",
+        "note": note[:1200],
+    }
+    with config.notes_file.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    return "Team note saved."
+
+
+def recent_team_notes(config: Config, limit: int = 10) -> list[dict[str, Any]]:
+    try:
+        lines = config.notes_file.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return []
+    notes: list[dict[str, Any]] = []
+    for line in lines[-max(1, limit) :]:
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, dict):
+            notes.append(item)
+    return notes
+
+
+def render_team_notes(config: Config, limit: int = 10) -> str:
+    notes = recent_team_notes(config, limit)
+    if not notes:
+        return "No team notes saved yet."
+    lines = [f"Recent team notes · {len(notes)}"]
+    for item in notes:
+        when = str(item.get("created_at", ""))[:16].replace("T", " ")
+        author = str(item.get("author") or "Team")
+        note = str(item.get("note") or "").strip()
+        lines.append(f"• {when} · {author}: {note}")
+    return "\n".join(lines)
+
+
+def save_team_notes_to_google_doc(config: Config) -> str:
+    ready, detail = google_docs_ready(config)
+    if not ready:
+        return f"Google Docs not ready: {detail}"
+    notes_text = render_team_notes(config, 20)
+    now = ist_now().strftime("%d %b %Y, %I:%M %p")
+    text = f"\n\nTEAM NOTES UPDATE\nGenerated: {now}\n\n{notes_text}\n"
+    document_id = config.google_docs_report_id or create_google_doc(config, f"TranquilWaters Team Notes {ist_now().date().isoformat()}")
+    link = append_google_doc(config, document_id, text)
+    return f"Saved team notes to Google Docs:\n{link}"
+
+
 def set_commands(config: Config) -> None:
     telegram_call(
         config,
@@ -372,6 +511,9 @@ def set_commands(config: Config) -> None:
                 {"command": "session", "description": "PMS session check"},
                 {"command": "doc_report", "description": "Save PMS summary to Google Docs"},
                 {"command": "doc_status", "description": "Check Google Docs setup"},
+                {"command": "note", "description": "Save a team note"},
+                {"command": "notes", "description": "Show recent team notes"},
+                {"command": "doc_notes", "description": "Save recent notes to Google Docs"},
             ]
         },
     )
@@ -394,6 +536,7 @@ def run(config: Config) -> None:
                 {"offset": offset, "timeout": poll_timeout, "allowed_updates": ["message", "channel_post"]},
                 timeout=max(config.request_timeout_seconds, poll_timeout + 10),
             )
+            maybe_run_auto_report(config)
             for update in updates or []:
                 offset = max(offset, int(update["update_id"]) + 1)
                 message = update.get("message") or update.get("channel_post") or {}
@@ -431,6 +574,21 @@ def run(config: Config) -> None:
                     except Exception as exc:
                         LOG.exception("Google Docs report failed")
                         send_message(config, chat_id, f"/doc_report failed: {type(exc).__name__}: {exc}")
+                    continue
+                if command == "/note":
+                    author = str(sender.get("first_name") or sender.get("username") or "Team")
+                    note = text.strip().split(maxsplit=1)[1] if len(text.strip().split(maxsplit=1)) > 1 else ""
+                    send_message(config, chat_id, append_team_note(config, chat_id, user_id, author, note))
+                    continue
+                if command == "/notes":
+                    send_message(config, chat_id, render_team_notes(config))
+                    continue
+                if command == "/doc_notes":
+                    try:
+                        send_message(config, chat_id, save_team_notes_to_google_doc(config))
+                    except Exception as exc:
+                        LOG.exception("Google Docs notes failed")
+                        send_message(config, chat_id, f"/doc_notes failed: {type(exc).__name__}: {exc}")
                     continue
                 send_message(config, chat_id, hermes_reply(config, text))
         except KeyboardInterrupt:
