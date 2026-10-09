@@ -11,9 +11,17 @@ import os
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+try:
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+except Exception:  # Google Docs integration is optional until dependencies are installed.
+    service_account = None
+    build = None
 
 import pms_readonly as pms_bot
 
@@ -40,6 +48,9 @@ class Config:
     request_timeout_seconds: int
     assistant_name: str
     system_prompt: str
+    google_credentials_file: str
+    google_docs_folder_id: str
+    google_docs_report_id: str
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -60,6 +71,9 @@ class Config:
             request_timeout_seconds=max(2, int(os.getenv("REQUEST_TIMEOUT_SECONDS", "12") or "12")),
             assistant_name=os.getenv("HERMES_ASSISTANT_NAME", "Hermes").strip() or "Hermes",
             system_prompt=os.getenv("HERMES_SYSTEM_PROMPT", default_prompt).strip() or default_prompt,
+            google_credentials_file=os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip(),
+            google_docs_folder_id=os.getenv("GOOGLE_DOCS_FOLDER_ID", "").strip(),
+            google_docs_report_id=os.getenv("GOOGLE_DOCS_REPORT_ID", "").strip(),
         )
 
 
@@ -155,7 +169,9 @@ def help_text(config: Config) -> str:
         "• /inhouse — guests currently checked in\n"
         "• /upcoming — upcoming bookings\n"
         "• /report — rooms, in-house, and upcoming summary\n"
-        "• /status — PMS/API health\n\n"
+        "• /status — PMS/API health\n"
+        "• /doc_report — append today's PMS summary to Google Docs\n"
+        "• /doc_status — check Google Docs setup\n\n"
         "PMS write actions stay in the Lily's Desk PMS bot."
     )
 
@@ -186,6 +202,88 @@ def pms_report(action: str) -> str:
     return "Unknown PMS report."
 
 
+GOOGLE_DOC_SCOPES = (
+    "https://www.googleapis.com/auth/documents",
+    "https://www.googleapis.com/auth/drive.file",
+)
+
+
+def google_docs_ready(config: Config) -> tuple[bool, str]:
+    if service_account is None or build is None:
+        return False, "Google client libraries are not installed. Install google-api-python-client and google-auth."
+    if not config.google_credentials_file:
+        return False, "GOOGLE_APPLICATION_CREDENTIALS is not set."
+    path = Path(config.google_credentials_file)
+    if not path.exists():
+        return False, f"Google credentials file not found: {path}"
+    if not config.google_docs_report_id and not config.google_docs_folder_id:
+        return False, "Set GOOGLE_DOCS_REPORT_ID for an existing doc, or GOOGLE_DOCS_FOLDER_ID to create report docs in a Drive folder."
+    return True, "Google Docs integration is configured."
+
+
+def google_credentials(config: Config):
+    ready, detail = google_docs_ready(config)
+    if not ready:
+        raise RuntimeError(detail)
+    return service_account.Credentials.from_service_account_file(
+        config.google_credentials_file,
+        scopes=list(GOOGLE_DOC_SCOPES),
+    )
+
+
+def docs_service(config: Config):
+    return build("docs", "v1", credentials=google_credentials(config), cache_discovery=False)
+
+
+def drive_service(config: Config):
+    return build("drive", "v3", credentials=google_credentials(config), cache_discovery=False)
+
+
+def create_google_doc(config: Config, title: str) -> str:
+    metadata: dict[str, Any] = {
+        "name": title,
+        "mimeType": "application/vnd.google-apps.document",
+    }
+    if config.google_docs_folder_id:
+        metadata["parents"] = [config.google_docs_folder_id]
+    created = drive_service(config).files().create(
+        body=metadata,
+        fields="id,webViewLink",
+        supportsAllDrives=True,
+    ).execute()
+    return str(created["id"])
+
+
+def document_end_index(document: dict[str, Any]) -> int:
+    content = document.get("body", {}).get("content", [])
+    if not content:
+        return 1
+    return max(1, int(content[-1].get("endIndex", 1)) - 1)
+
+
+def append_google_doc(config: Config, document_id: str, text: str) -> str:
+    service = docs_service(config)
+    document = service.documents().get(documentId=document_id).execute()
+    index = document_end_index(document)
+    service.documents().batchUpdate(
+        documentId=document_id,
+        body={"requests": [{"insertText": {"location": {"index": index}, "text": text}}]},
+    ).execute()
+    return f"https://docs.google.com/document/d/{document_id}/edit"
+
+
+def save_pms_report_to_google_doc(config: Config) -> str:
+    ready, detail = google_docs_ready(config)
+    if not ready:
+        return f"Google Docs not ready: {detail}"
+    report = pms_report("report")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    title = f"TranquilWaters PMS Report {datetime.now().strftime('%Y-%m-%d')}"
+    document_id = config.google_docs_report_id or create_google_doc(config, title)
+    link = append_google_doc(config, document_id, f"\n\n## PMS Report — {now}\n\n{report}\n")
+    return f"Saved PMS report to Google Docs:\n{link}"
+
+
 def set_commands(config: Config) -> None:
     telegram_call(
         config,
@@ -200,6 +298,8 @@ def set_commands(config: Config) -> None:
                 {"command": "report", "description": "Read-only PMS daily summary"},
                 {"command": "status", "description": "PMS/API health"},
                 {"command": "session", "description": "PMS session check"},
+                {"command": "doc_report", "description": "Save PMS summary to Google Docs"},
+                {"command": "doc_status", "description": "Check Google Docs setup"},
             ]
         },
     )
@@ -248,6 +348,17 @@ def run(config: Config) -> None:
                     except Exception as exc:
                         LOG.exception("PMS read-only command failed: %s", command)
                         send_message(config, chat_id, f"{command} failed: {type(exc).__name__}: {exc}")
+                    continue
+                if command == "/doc_status":
+                    ready, detail = google_docs_ready(config)
+                    send_message(config, chat_id, f"Google Docs: {'READY' if ready else 'NOT READY'}\n{detail}")
+                    continue
+                if command == "/doc_report":
+                    try:
+                        send_message(config, chat_id, save_pms_report_to_google_doc(config))
+                    except Exception as exc:
+                        LOG.exception("Google Docs report failed")
+                        send_message(config, chat_id, f"/doc_report failed: {type(exc).__name__}: {exc}")
                     continue
                 send_message(config, chat_id, hermes_reply(config, text))
         except KeyboardInterrupt:
